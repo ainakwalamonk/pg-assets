@@ -1,0 +1,112 @@
+# Builds pgvector 0.8.0 against PostgreSQL 17 for every platform we ship, and publishes
+# vector-<platform>-pg<major>.tar.gz (+ .sha256) as release assets. src/db/pg-provision.ts downloads +
+# verifies + installs the matching artifact on first run. CRITICAL: conservative -march (NEVER -march=native)
+# so the .so loads on any user CPU (else "Illegal instruction"). Artifact layout: extension/vector.* + lib/vector.<ext>.
+name: build-pgvector
+on:
+  workflow_dispatch:
+    inputs:
+      pgvector_ref: { description: "pgvector version (no 'v'; used as v<ref> git tag + pgvector-<ref> release tag)", default: "0.8.0" }
+      pg_major: { description: "PostgreSQL major", default: "17" }
+
+env:
+  PGVECTOR_REF: ${{ github.event.inputs.pgvector_ref || '0.8.0' }}
+  PG_MAJOR: ${{ github.event.inputs.pg_major || '17' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, os: macos-14 }
+          - { platform: darwin-x64,   os: macos-13 }
+          - { platform: linux-x64,    os: ubuntu-22.04 }
+          - { platform: linux-arm64,  os: ubuntu-22.04-arm }
+          - { platform: win32-x64,    os: windows-2022 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Clone pgvector
+        run: git clone --depth 1 --branch "v$PGVECTOR_REF" https://github.com/pgvector/pgvector.git
+        shell: bash
+
+      # ---- macOS: homebrew PG17, conservative OPTFLAGS ----
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install "postgresql@${PG_MAJOR}"
+          PGCFG="$(brew --prefix postgresql@${PG_MAJOR})/bin/pg_config"
+          OPT="$([ '${{ matrix.platform }}' = 'darwin-x64' ] && echo '-march=x86-64-v2' || echo '-mcpu=apple-m1')"
+          make -C pgvector OPTFLAGS="$OPT" PG_CONFIG="$PGCFG"
+          make -C pgvector install DESTDIR="$PWD/stage" PG_CONFIG="$PGCFG"
+
+      # ---- Linux: PGDG PG17 dev headers, conservative OPTFLAGS ----
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y build-essential "postgresql-server-dev-${PG_MAJOR}"
+          PGCFG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+          OPT="$([ '${{ matrix.platform }}' = 'linux-arm64' ] && echo '-march=armv8-a' || echo '-march=x86-64-v2')"
+          make -C pgvector OPTFLAGS="$OPT" PG_CONFIG="$PGCFG"
+          make -C pgvector install DESTDIR="$PWD/stage" PG_CONFIG="$PGCFG"
+
+      # ---- Windows: MSVC nmake against an installed PG17 ----
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          choco install postgresql%PG_MAJOR% --params '/Password:pgvector' -y --no-progress
+          for /d %%D in ("C:\Program Files\PostgreSQL\%PG_MAJOR%*") do set PGROOT=%%~fD
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cd pgvector
+          nmake /NOLOGO /F Makefile.win PGROOT="%PGROOT%"
+          nmake /NOLOGO /F Makefile.win PGROOT="%PGROOT%" install
+          mkdir "%GITHUB_WORKSPACE%\stage\extension" "%GITHUB_WORKSPACE%\stage\lib"
+          copy "%PGROOT%\share\extension\vector*" "%GITHUB_WORKSPACE%\stage\extension\"
+          copy "%PGROOT%\lib\vector.dll" "%GITHUB_WORKSPACE%\stage\lib\"
+
+      # ---- Normalize layout → extension/ + lib/ → tar.gz + sha256 (unix) ----
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p out/extension out/lib
+          find stage -path '*extension/vector*' -exec cp {} out/extension/ \;
+          find stage \( -name 'vector.so' -o -name 'vector.dylib' \) -exec cp {} out/lib/ \;
+          NAME="vector-${{ matrix.platform }}-pg${PG_MAJOR}.tar.gz"
+          tar -C out -czf "$NAME" extension lib
+          shasum -a 256 "$NAME" | tee "$NAME.sha256"
+          ls -la "$NAME"; tar -tzf "$NAME"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          NAME="vector-${{ matrix.platform }}-pg${PG_MAJOR}.tar.gz"
+          tar -C stage -czf "$NAME" extension lib
+          sha256sum "$NAME" | tee "$NAME.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vector-${{ matrix.platform }}-pg${{ env.PG_MAJOR }}
+          path: |
+            vector-*.tar.gz
+            vector-*.tar.gz.sha256
+
+  # Attach all matrix artifacts to a release tag `pgvector-<ref>` (host = FABRIC_PG_ASSETS_URL default).
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pgvector-${{ env.PGVECTOR_REF }}
+          files: dist/*
