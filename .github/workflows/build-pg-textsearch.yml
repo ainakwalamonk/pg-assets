@@ -1,0 +1,129 @@
+# Builds pg_textsearch (Tiger Data) against PostgreSQL 17 for every platform fabmem ships, and publishes
+# pg_textsearch-<platform>-pg<major>.tar.gz (+ .sha256) as release assets under tag pg_textsearch-<ref>.
+# fabmem bundles these into its npm tarball at pack time (scripts/fetch-pg-ext.mjs), so a published install
+# carries the module for its platform and never downloads or compiles anything.
+#
+# Artifact layout: extension/pg_textsearch.* + lib/pg_textsearch.<so|dylib|dll> — identical to the pgvector
+# artifact, so one installer serves both.
+#
+# Upstream ships Linux binaries only and has no Windows build at all: its Makefile is PGXS/Unix-make and there
+# is not one _WIN32 conditional in its 42 C files. patches/pg_textsearch/Makefile.win (authored here, mirroring
+# pgvector's) plus an empty <unistd.h> shim — segment.c includes it but uses no symbol from it — build it with
+# MSVC without patching upstream source.
+#
+# No -march flags (unlike pgvector): the Makefile adds only -O2 and the SIMD paths in src/segment/compression.c
+# are guarded by __SSE2__ / __ARM_NEON, baseline on x86-64 and arm64.
+name: build-pg-textsearch
+on:
+  workflow_dispatch:
+    inputs:
+      pgts_ref: { description: "pg_textsearch version (no 'v'; used as v<ref> git tag + pg_textsearch-<ref> release tag)", default: "1.4.0" }
+      pg_major: { description: "PostgreSQL major", default: "17" }
+
+env:
+  PGTS_REF: ${{ github.event.inputs.pgts_ref || '1.4.0' }}
+  PG_MAJOR: ${{ github.event.inputs.pg_major || '17' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, os: macos-14 }
+          - { platform: darwin-x64,   os: macos-15-intel }
+          - { platform: linux-x64,    os: ubuntu-22.04 }
+          - { platform: linux-arm64,  os: ubuntu-22.04-arm }
+          - { platform: win32-x64,    os: windows-2022 }
+    runs-on: ${{ matrix.os }}
+    # A previous build-pgvector run sat queued for 24h on a retired runner label and was cancelled, taking the
+    # whole release with it. Fail in an hour instead.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4          # for patches/pg_textsearch (the Windows build inputs)
+
+      - name: Clone pg_textsearch
+        run: git clone --depth 1 --branch "v$PGTS_REF" https://github.com/timescale/pg_textsearch.git upstream
+        shell: bash
+
+      # macOS: PGXS bakes the SDK path recorded when Homebrew's PG was built, which is often absent on a runner
+      # (clang then fails to find stdio.h). PG_SYSROOT overrides it. MACOSX_DEPLOYMENT_TARGET pins the load
+      # floor, or the bundle records the builder's OS version and refuses to load on anything older.
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install "postgresql@${PG_MAJOR}"
+          PGCFG="$(brew --prefix postgresql@${PG_MAJOR})/bin/pg_config"
+          export MACOSX_DEPLOYMENT_TARGET="$([ '${{ matrix.platform }}' = 'darwin-x64' ] && echo '13.0' || echo '14.0')"
+          make -C upstream PG_CONFIG="$PGCFG" PG_SYSROOT="$(xcrun --show-sdk-path)"
+          make -C upstream install DESTDIR="$PWD/stage" PG_CONFIG="$PGCFG" PG_SYSROOT="$(xcrun --show-sdk-path)"
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y build-essential "postgresql-server-dev-${PG_MAJOR}"
+          PGCFG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+          make -C upstream PG_CONFIG="$PGCFG"
+          make -C upstream install DESTDIR="$PWD/stage" PG_CONFIG="$PGCFG"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          choco install postgresql%PG_MAJOR% --params "/Password:pgts" -y --no-progress
+          for /d %%D in ("C:\Program Files\PostgreSQL\%PG_MAJOR%*") do set PGROOT=%%~fD
+          copy "%GITHUB_WORKSPACE%\patches\pg_textsearch\Makefile.win" upstream\Makefile.win
+          xcopy /e /i /y "%GITHUB_WORKSPACE%\patches\pg_textsearch\msvc-shim" upstream\msvc-shim
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cd upstream
+          nmake /NOLOGO /F Makefile.win PGROOT="%PGROOT%"
+          if errorlevel 1 exit /b 1
+          mkdir "%GITHUB_WORKSPACE%\stage\extension" "%GITHUB_WORKSPACE%\stage\lib"
+          copy pg_textsearch.dll "%GITHUB_WORKSPACE%\stage\lib\"
+          copy pg_textsearch.control "%GITHUB_WORKSPACE%\stage\extension\"
+          copy sql\pg_textsearch--*.sql "%GITHUB_WORKSPACE%\stage\extension\"
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out/extension out/lib
+          find stage -path '*extension/pg_textsearch*' -exec cp {} out/extension/ \;
+          find stage \( -name 'pg_textsearch.so' -o -name 'pg_textsearch.dylib' -o -name 'pg_textsearch.dll' \) -exec cp {} out/lib/ \;
+          # The Makefile builds with -g, so the module carries a debug symbol table that is useless to users and
+          # ships to every install: .debug_* is 81% of the Linux module (1.80 MB -> 0.26 MB stripped).
+          if [ "${{ runner.os }}" = "Linux" ]; then strip --strip-unneeded out/lib/*; fi
+          if [ "${{ runner.os }}" = "macOS" ]; then strip -x out/lib/*; fi
+          test -s out/extension/pg_textsearch.control || { echo "no control file staged"; exit 1; }
+          test -n "$(ls out/lib)" || { echo "no module staged"; exit 1; }
+          ls out/extension/pg_textsearch--*.sql >/dev/null || { echo "no SQL staged"; exit 1; }
+          NAME="pg_textsearch-${{ matrix.platform }}-pg${PG_MAJOR}.tar.gz"
+          tar -C out -czf "$NAME" extension lib
+          shasum -a 256 "$NAME" | tee "$NAME.sha256"
+          ls -la "$NAME"; tar -tzf "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pg_textsearch-${{ matrix.platform }}-pg${{ env.PG_MAJOR }}
+          path: |
+            pg_textsearch-*.tar.gz
+            pg_textsearch-*.tar.gz.sha256
+
+  release:
+    needs: build
+    if: always() && needs.build.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pg_textsearch-${{ env.PGTS_REF }}
+          files: dist/*

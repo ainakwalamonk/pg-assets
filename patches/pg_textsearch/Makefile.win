@@ -1,0 +1,107 @@
+# MSVC/nmake build for pg_textsearch — upstream ships a PGXS Makefile only (no Windows support), so this
+# is authored here and copied into the clone by .github/workflows/build-pg-textsearch.yml.
+# Mirrors pgvector's Makefile.win. One inference rule per source directory: nmake inference rules are
+# path-scoped, so a single {src} rule would not match src\access, src\memtable, and so on.
+# Generated from the v1.4.0 tree; regenerate if upstream adds or moves a .c file.
+
+EXTENSION = pg_textsearch
+EXTVERSION = 1.4.0
+
+OBJS = src\access\build.obj \
+       src\access\build_context.obj \
+       src\access\build_parallel.obj \
+       src\access\handler.obj \
+       src\access\scan.obj \
+       src\access\vacuum.obj \
+       src\debug\dump.obj \
+       src\index\freepage.obj \
+       src\index\limit.obj \
+       src\index\metapage.obj \
+       src\index\registry.obj \
+       src\index\resolve.obj \
+       src\index\source.obj \
+       src\index\state.obj \
+       src\memtable\arena.obj \
+       src\memtable\cache.obj \
+       src\memtable\cache_source.obj \
+       src\memtable\chain_source.obj \
+       src\memtable\chain_walker.obj \
+       src\memtable\expull.obj \
+       src\memtable\log.obj \
+       src\memtable\page.obj \
+       src\memtable\posting.obj \
+       src\memtable\scan.obj \
+       src\memtable\stringtable.obj \
+       src\mod.obj \
+       src\planner\cost.obj \
+       src\planner\hooks.obj \
+       src\scoring\bm25.obj \
+       src\scoring\bmw.obj \
+       src\segment\alive_bitset.obj \
+       src\segment\compression.obj \
+       src\segment\dictionary.obj \
+       src\segment\docmap.obj \
+       src\segment\fieldnorm.obj \
+       src\segment\merge.obj \
+       src\segment\scan.obj \
+       src\segment\segment.obj \
+       src\segment\tombstone.obj \
+       src\types\array.obj \
+       src\types\query.obj \
+       src\types\vector.obj
+
+!ifndef PGROOT
+!error PGROOT is not set
+!endif
+INCLUDEDIR = $(PGROOT)\include
+INCLUDEDIR_SERVER = $(PGROOT)\include\server
+LIBDIR = $(PGROOT)\lib
+PKGLIBDIR = $(PGROOT)\lib
+SHAREDIR = $(PGROOT)\share
+
+# msvc-shim supplies the <unistd.h> that src\segment\segment.c includes but takes no symbol from.
+CFLAGS = /nologo /std:c11 /I"msvc-shim" /I"src" /I"$(INCLUDEDIR_SERVER)\port\win32_msvc" /I"$(INCLUDEDIR_SERVER)\port\win32" /I"$(INCLUDEDIR_SERVER)" /I"$(INCLUDEDIR)"
+CFLAGS = $(CFLAGS) /O2 /DPG_TEXTSEARCH_VERSION=\"$(EXTVERSION)\" $(PG_CFLAGS)
+
+SHLIB = $(EXTENSION).dll
+LIBS = "$(LIBDIR)\postgres.lib"
+
+all: $(SHLIB)
+
+{src}.c{src}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\access}.c{src\access}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\debug}.c{src\debug}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\index}.c{src\index}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\memtable}.c{src\memtable}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\planner}.c{src\planner}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\scoring}.c{src\scoring}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\segment}.c{src\segment}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+{src\types}.c{src\types}.obj:
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+$(SHLIB): $(OBJS)
+	$(CC) $(CFLAGS) $(OBJS) $(LIBS) /link /DLL /OUT:$(SHLIB)
+
+install: all
+	copy $(SHLIB) "$(PKGLIBDIR)"
+	copy $(EXTENSION).control "$(SHAREDIR)\extension"
+	copy sql\$(EXTENSION)--*.sql "$(SHAREDIR)\extension"
+
+clean:
+	del /f /q $(SHLIB) $(EXTENSION).lib $(EXTENSION).exp
