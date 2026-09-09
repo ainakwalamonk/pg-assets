@@ -122,7 +122,8 @@ jobs:
           ls out/extension/pg_textsearch--*.sql >/dev/null || { echo "no SQL staged"; exit 1; }
           NAME="pg_textsearch-${{ matrix.platform }}-pg${PG_MAJOR}.tar.gz"
           tar -C out -czf "$NAME" extension lib
-          shasum -a 256 "$NAME" | tee "$NAME.sha256"
+          # Git Bash on the Windows runner has sha256sum but not shasum; macOS has shasum but not sha256sum.
+          { command -v sha256sum >/dev/null && sha256sum "$NAME" || shasum -a 256 "$NAME"; } | tee "$NAME.sha256"
           ls -la "$NAME"; tar -tzf "$NAME"
 
       - uses: actions/upload-artifact@v4
