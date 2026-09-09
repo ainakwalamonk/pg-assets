@@ -6,10 +6,14 @@
 # Artifact layout: extension/pg_textsearch.* + lib/pg_textsearch.<so|dylib|dll> — identical to the pgvector
 # artifact, so one installer serves both.
 #
-# Upstream ships Linux binaries only and has no Windows build at all: its Makefile is PGXS/Unix-make and there
-# is not one _WIN32 conditional in its 42 C files. patches/pg_textsearch/Makefile.win (authored here, mirroring
-# pgvector's) plus an empty <unistd.h> shim — segment.c includes it but uses no symbol from it — build it with
-# MSVC without patching upstream source.
+# Upstream ships Linux binaries only and has no Windows build: its Makefile is PGXS/Unix-make and there is not
+# one _WIN32 conditional in its 42 C files. Three pieces make Windows work, all under patches/pg_textsearch/:
+#   Makefile.win               an nmake build mirroring pgvector's
+#   msvc-shim/unistd.h         an empty stand-in; segment.c includes it but uses no symbol from it
+#   apply-portable-packing.py  rewrites 7 trailing __attribute__((packed))/((aligned)) structs into
+#                              #pragma pack / __declspec(align), asserting sizeof+alignof so the on-disk index
+#                              format cannot shift. Defining __attribute__ away would compile and silently
+#                              corrupt segments instead.
 #
 # No -march flags (unlike pgvector): the Makefile adds only -O2 and the SIMD paths in src/segment/compression.c
 # are guarded by __SSE2__ / __ARM_NEON, baseline on x86-64 and arm64.
@@ -45,6 +49,14 @@ jobs:
       - name: Clone pg_textsearch
         run: git clone --depth 1 --branch "v$PGTS_REF" https://github.com/timescale/pg_textsearch.git upstream
         shell: bash
+
+      # Rewrite upstream's trailing GCC struct attributes into #pragma pack / __declspec(align), which MSVC
+      # also accepts, and inject StaticAssertDecl on sizeof+alignof for all seven affected structs. Applied on
+      # EVERY platform on purpose: the GCC and Clang builds then verify the same assertions, so a layout drift
+      # fails here rather than silently corrupting an index on Windows.
+      - name: Make struct layout portable
+        shell: bash
+        run: python3 patches/pg_textsearch/apply-portable-packing.py upstream patches/pg_textsearch/tp_portable.h
 
       # macOS: PGXS bakes the SDK path recorded when Homebrew's PG was built, which is often absent on a runner
       # (clang then fails to find stdio.h). PG_SYSROOT overrides it. MACOSX_DEPLOYMENT_TARGET pins the load
