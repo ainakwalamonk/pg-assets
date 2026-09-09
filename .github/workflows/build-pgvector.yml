@@ -49,6 +49,9 @@ jobs:
         run: |
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          # The x64 runner image carries third-party repos (google-chrome, microsoft-prod) we don't need; a hash
+          # mismatch in ANY of them makes `apt-get update` exit non-zero and kills the build. Drop them first.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y build-essential "postgresql-server-dev-${PG_MAJOR}"
           PGCFG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
