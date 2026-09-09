@@ -92,14 +92,17 @@ for name in sorted(set(v1_names)):
     hit = False
     for dirpath, _, files in os.walk(os.path.join(root, "src")):
         for f in files:
-            if not f.endswith(".c"):
+            if not f.endswith((".c", ".h")):
                 continue
             p = os.path.join(dirpath, f)
             src = open(p).read()
-            # Definition only (followed by `{`). The arg list may carry extra macros, e.g.
-            # `(PG_FUNCTION_ARGS pg_attribute_unused())`, so consume to the last `)` on the line.
+            # BOTH the definition (`{`) and any prototype (`;`) must carry the export, or MSVC reports
+            # C2375: a plain `Datum tp_handler(PG_FUNCTION_ARGS);` in a header included before
+            # PG_FUNCTION_INFO_V1 conflicts with the PGDLLEXPORT declaration the macro emits.
+            # The arg list may carry extra macros, e.g. `(PG_FUNCTION_ARGS pg_attribute_unused())`,
+            # so consume to the last `)` on the line.
             pat = re.compile(r"(?<!PGDLLEXPORT )\bDatum(\s+)" + re.escape(name)
-                             + r"\(PG_FUNCTION_ARGS([^\n]*)\)(\s*\{)")
+                             + r"\(PG_FUNCTION_ARGS([^\n]*)\)(\s*[;{])")
             src2, n = pat.subn(r"PGDLLEXPORT Datum\1" + name + r"(PG_FUNCTION_ARGS\2)\3", src)
             if n:
                 open(p, "w").write(src2)
